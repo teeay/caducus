@@ -1,0 +1,30 @@
+# This file is part of the caducus crate.
+# SPDX-FileCopyrightText: 2026 Zivatar Limited
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name          = "caducus"
+version       = "0.2.0"
+edition       = "2021"
+rust-version  = "1.71"
+authors       = ["teeay"]
+description   = "Rust bounded MPSC/SPSC channel with expiry"
+license       = "Apache-2.0"
+repository    = "https://github.com/teeay/caducus"
+homepage      = "https://teeay.dev/caducus"
+documentation = "https://docs.rs/caducus"
+readme        = "README.md"
+keywords      = ["channel", "async", "ttl", "mpsc", "spsc"]
+categories    = ["asynchronous", "concurrency", "data-structures"]
+exclude       = ["docs/review-memory.md", "AGENTS.md", ".claude"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+log = "0.4"
+tokio = { version = "1.37", features = ["sync", "time", "rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.37", features = ["macros", "rt", "rt-multi-thread", "time"] }
