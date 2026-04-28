@@ -79,7 +79,6 @@ struct Slot<T> {
     shutdown_channel: Option<Arc<dyn ReportChannel<T>>>,
 }
 
-#[allow(dead_code)]
 impl<T> Slot<T> {
     fn empty() -> Self {
         Self {
@@ -141,7 +140,6 @@ pub(crate) struct Ring<T> {
     ttl_reduced: bool,
 }
 
-#[allow(dead_code)]
 impl<T> Ring<T> {
     pub(crate) const MIN_TTL: Duration = Duration::from_millis(1);
     pub(crate) const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
@@ -299,8 +297,7 @@ impl<T> Ring<T> {
     /// FIFO-monotonic.
     pub fn drain_expired(&mut self, now: Instant) -> Vec<PopResult<T>> {
         if !self.ttl_reduced {
-            // Fast path: contiguous head prefix only. Identical to the
-            // original behaviour.
+            // Fast path: contiguous head prefix only.
             let mut items = Vec::new();
             while let Some(expires_at) = self.slots.get(self.head).map(|s| s.expires_at) {
                 if self.len == 0 || expires_at > now {
@@ -375,7 +372,7 @@ impl<T> Ring<T> {
             }
             self.slots = new_slots;
             self.head = 0;
-            self.tail = placed % new_cap;
+            self.tail = placed % self.slots.len();
             self.target_capacity = new_cap;
             debug_assert_eq!(self.len, placed);
         } else {
@@ -427,29 +424,6 @@ impl<T> Ring<T> {
         items
     }
 
-    /// Number of occupied slots.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Current allocated slot count.
-    pub fn capacity(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Effective capacity limit. Equals `capacity()` when no shrink is pending.
-    pub fn target_capacity(&self) -> usize {
-        self.target_capacity
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.len >= self.target_capacity
-    }
-
     pub fn is_shutdown(&self) -> bool {
         self.shutdown
     }
@@ -477,19 +451,6 @@ impl<T> Ring<T> {
         Ok(())
     }
 
-    /// Test-only accessor for the `ttl_reduced` flag. The enclosing impl has
-    /// `#[allow(dead_code)]` so this does not emit warnings in non-test
-    /// builds.
-    pub(crate) fn ttl_reduced(&self) -> bool {
-        self.ttl_reduced
-    }
-
-    /// Test-only accessor for the head slot's `expires_at`. Caller must
-    /// ensure the ring is non-empty.
-    pub(crate) fn slots_head_deadline_for_test(&self) -> Instant {
-        self.slots[self.head].expires_at
-    }
-
     /// Requests a new capacity. Clamped to a minimum of 1.
     ///
     /// Growth reallocates immediately. Shrink reallocates immediately if
@@ -510,7 +471,7 @@ impl<T> Ring<T> {
                 // Immediate shrink.
                 self.linearize(new);
             }
-            // Otherwise deferred: compaction happens in try_pop/shutdown.
+            // Otherwise deferred: compaction happens in try_pop.
         } else {
             // new == current but target_capacity differs (e.g. cancelling a pending shrink).
             self.target_capacity = new;
@@ -552,7 +513,7 @@ impl<T> Ring<T> {
         }
         self.slots = new_slots;
         self.head = 0;
-        self.tail = self.len % new_capacity;
+        self.tail = self.len % self.slots.len();
         self.target_capacity = new_capacity;
     }
 

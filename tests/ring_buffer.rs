@@ -5,14 +5,11 @@
 /// Stub concurrency module with error types and ring buffer submodule.
 /// The ring buffer source uses `use super::{CaducusError, CaducusErrorKind}`
 /// which resolves to these stubs.
-#[allow(dead_code)]
 mod concurrency {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum CaducusErrorKind<T = ()> {
         InvalidArgument,
         InvalidPattern(T),
-        NoRuntime,
-        Timeout,
         Shutdown(T),
         Full(T),
     }
@@ -30,17 +27,11 @@ mod concurrency {
         pub fn validate<T>(ring: &Ring<T>) {
             let cap = ring.capacity();
             assert!(
-                ring.len() <= cap,
+                ring.len <= cap,
                 "len {} exceeds capacity {}",
-                ring.len(),
+                ring.len,
                 cap
             );
-            if ring.is_empty() {
-                assert_eq!(ring.len(), 0);
-            }
-            if ring.len() >= ring.target_capacity() {
-                assert!(ring.is_full());
-            }
             // Verify occupied slots match len.
             let mut occupied = 0;
             for i in 0..ring.len {
@@ -53,11 +44,43 @@ mod concurrency {
                 );
                 occupied += 1;
             }
-            assert_eq!(occupied, ring.len());
+            assert_eq!(occupied, ring.len);
         }
 
         pub fn force_raw_ttl<T>(ring: &mut Ring<T>, ttl: Duration) {
             ring.ttl = ttl;
+        }
+
+        /// Test-only accessors. Built here rather than in `src/` so that
+        /// production code carries no test scaffolding (per AGENTS.md).
+        impl<T> Ring<T> {
+            pub fn len(&self) -> usize {
+                self.len
+            }
+
+            pub fn capacity(&self) -> usize {
+                self.slots.len()
+            }
+
+            pub fn target_capacity(&self) -> usize {
+                self.target_capacity
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.len == 0
+            }
+
+            pub fn is_full(&self) -> bool {
+                self.len >= self.target_capacity
+            }
+
+            pub fn ttl_reduced(&self) -> bool {
+                self.ttl_reduced
+            }
+
+            pub fn head_deadline(&self) -> Instant {
+                self.slots[self.head].expires_at
+            }
         }
     }
 }
@@ -92,6 +115,12 @@ impl<T: Send + 'static> ReportChannel<T> for TestChannel {
     fn send(&self, _item: T) -> Result<(), T> {
         Ok(())
     }
+}
+
+#[test]
+fn report_channel_send_returns_ok() {
+    let ch: Arc<dyn ReportChannel<i32>> = Arc::new(TestChannel);
+    assert!(ch.send(7).is_ok());
 }
 
 fn push_val(ring: &mut Ring<i32>, val: i32) {
@@ -1327,7 +1356,7 @@ fn peek_expires_at_head_only_when_flag_clear() {
     push_val(&mut ring, 1);
     push_val(&mut ring, 2);
     assert!(!ring.ttl_reduced());
-    let head_deadline = ring.slots_head_deadline_for_test();
+    let head_deadline = ring.head_deadline();
     assert_eq!(ring.peek_expires_at().unwrap(), head_deadline);
 }
 
@@ -1342,7 +1371,7 @@ fn peek_expires_at_returns_minimum_when_flag_set() {
     assert!(ring.ttl_reduced());
     let min = ring.peek_expires_at().unwrap();
     // Minimum deadline must be B's, which is shorter than A's and C's.
-    let head = ring.slots_head_deadline_for_test();
+    let head = ring.head_deadline();
     assert!(
         min < head,
         "peek must return minimum (B's deadline), not head's (A's)"

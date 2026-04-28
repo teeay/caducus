@@ -121,28 +121,29 @@ async fn reclaimer_loop<T: 'static>(
             None => return,
         };
 
-        // Step 2: create waiter before drain so no notification is lost.
+        // Step 2: create waiter before drain so no notification is lost, prevent
+        // concurrent shutdown from draining at the same time
         let waiter = notify_reclaimer.notified();
         tokio::pin!(waiter);
+        let report_guard = strong.reclaimer_reporting_lock();
 
         // Step 3: drain all expired items under one lock.
         let result = strong.drain(Instant::now(), DrainMode::DrainOnly);
 
-        // Step 3b: if shutdown, report remaining expired items and exit.
-        // Hold reclaimer_reporting across the report so a concurrent
-        // shutdown_and_report blocks until this batch is fully delivered.
-        if result.is_shutdown {
-            let _report_guard = strong.reclaimer_reporting_lock();
-            report_expired(result.expired);
-            return;
-        }
 
         // Step 4: report drained items (outside the ring lock, holding
         // reclaimer_reporting so shutdown_and_report sees the report flushed).
         let had_expired = !result.expired.is_empty();
         {
-            let _report_guard = strong.reclaimer_reporting_lock();
             report_expired(result.expired);
+        }
+
+        // Done reporting, drop report guard
+        drop(report_guard);
+
+        // Step 4a: if shutdown, we are done
+        if result.is_shutdown {
+            return;
         }
 
         // Drop the strong ref now that reporting is complete.

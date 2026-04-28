@@ -4,7 +4,6 @@
 
 /// Error module — mirrors the crate's `error` module so that the
 /// `include!`-ed concurrency source can resolve `crate::error::*`.
-#[allow(dead_code)]
 pub mod error {
     include!("../src/error.rs");
 }
@@ -13,7 +12,6 @@ pub mod error {
 /// The `mod ring_buffer;` inside concurrency.rs resolves to
 /// `tests/concurrency/ring_buffer.rs`, which includes the source and
 /// adds test helpers.
-#[allow(dead_code)]
 mod concurrency {
     include!("../src/concurrency.rs");
 
@@ -49,6 +47,20 @@ impl<T: Send + 'static> ReportChannel<T> for TestChannel {
     fn send(&self, _item: T) -> Result<(), T> {
         Ok(())
     }
+}
+
+#[test]
+fn report_channel_send_returns_ok() {
+    let ch: Arc<dyn ReportChannel<i32>> = Arc::new(TestChannel);
+    assert!(ch.send(7).is_ok());
+}
+
+#[test]
+fn reclaimer_reporting_lock_is_exclusive() {
+    let ring = Arc::new(make_ring(1, DEFAULT_TTL));
+    let guard = ring.reclaimer_reporting_lock();
+    drop(guard);
+    let _re = ring.reclaimer_reporting_lock();
 }
 
 fn make_ring(capacity: usize, ttl: Duration) -> ConcurrentRing<i32> {

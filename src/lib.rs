@@ -2,14 +2,18 @@
 // SPDX-FileCopyrightText: 2026 Zivatar Limited
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded async channel with item expiry and hard shutdown.
+//! Bounded async MPSC/SPSC channel with item expiry.
 //!
+//! Caducus (latin) = perishable
+//! 
 //! Caducus is a bounded asynchronous channel with two operating modes:
 //! single-producer single-consumer ([`SpscBuilder`] / [`SpscSender`]) and
 //! multi-producer single-consumer ([`MpscBuilder`] / [`MpscSender`]). Items
 //! carry a time-to-live and are evicted when they expire; the eviction is
-//! observable through user-supplied [`ReportChannel`]s. Dropping the last
-//! sender triggers a hard shutdown that drains and reports any items still in
+//! observable through user-supplied [`ReportChannel`]s.
+//!
+//! Use `shutdown()` on the sender side for controlled channel teardown. Dropping the last
+//! sender also triggers a hard shutdown that drains and reports any items still in
 //! the buffer.
 //!
 //! Caducus runs on Tokio. A runtime handle must be available either implicitly

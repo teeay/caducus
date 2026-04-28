@@ -18,9 +18,9 @@ use crate::reclaimer;
 
 /// Builder for an SPSC (single-producer, single-consumer) channel.
 ///
-/// Report channels are optional and stored at ring level. When a channel is
+/// Report channels are optional and used for all messages. When a channel is
 /// not configured, the corresponding outcomes (expiry or shutdown) are silently
-/// dropped, matching MPSC's `None`-channel semantics.
+/// dropped.
 pub struct SpscBuilder<T: Send + 'static> {
     capacity: usize,
     ttl: Duration,
@@ -93,6 +93,7 @@ impl<T: Send + 'static> SpscBuilder<T> {
 /// Builder for an MPSC (multi-producer, single-consumer) channel.
 ///
 /// Report channels are optional and set the initial sender-local defaults.
+/// Each item can carry separate reporting channels for each of the producers.
 pub struct MpscBuilder<T: Send + 'static> {
     capacity: usize,
     ttl: Duration,
