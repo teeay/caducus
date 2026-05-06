@@ -10,6 +10,8 @@ Status: Developed
 - Slots start empty and are populated only by push.
 - The slot structure is identical in both modes for predictable memory use.
 - The layer is synchronous; concurrency protection is the caller's responsibility.
+- Accept validated per-push expiry deadlines so senders can set item-specific TTLs or absolute
+  deadlines.
 
 ## Technical Details
 
@@ -22,7 +24,7 @@ Ring-level metadata:
 - `mode: ChannelMode` -- `Spsc` or `Mpsc`, set at construction, immutable.
 - `head: usize` -- index of the oldest occupied slot (next pop position).
 - `tail: usize` -- index of the next free slot (next push position).
-- `len: usize` -- number of currently occupied slots.
+- `len: usize` -- number of occupied slots.
 - `target_capacity: usize` -- desired capacity; differs from `slots.len()` only during a pending
   shrink.
 - `ttl: Duration` -- current time-to-live for newly enqueued items. `ttl()` is the single accessor
@@ -61,12 +63,12 @@ Each `Slot<T>` holds:
 
 #### Push
 
-Two push variants enforce the correct send pattern for the configured mode. Using the wrong variant
+Push variants enforce the correct send pattern for the configured mode. Using the wrong variant
 returns `CaducusErrorKind::InvalidPattern(item)`, carrying the item back to the caller.
 
-Both variants reject with `Shutdown(item)` if shut down, `Full(item)` if at capacity. Both compute
-`expires_at` from the ring's own `ttl()` using `checked_add` with a `MIN_TTL` fallback to guarantee
-a finite deadline.
+Both variants reject with `Shutdown(item)` if shut down, `Full(item)` if at capacity. The default
+variants compute `expires_at` from the ring's own `ttl()` using `checked_add` with a `MIN_TTL`
+fallback to guarantee a finite deadline.
 
 **`try_push_spsc(item: T) -> Result<(), CaducusError<T>>`**
 
@@ -77,6 +79,28 @@ SPSC push. Rejects with `InvalidPattern(item)` in MPSC mode. Populates the slot 
 
 MPSC push. Rejects with `InvalidPattern(item)` in SPSC mode. Populates the slot at `tail` with
 the provided per-slot channel handles and advances `tail` with wrapping.
+
+#### Per-Push Expiry
+
+The ring supports insertion paths that either use the configured default TTL or receive a final,
+validated `expires_at: Instant` from the caller. The common insertion primitive has this shape
+conceptually:
+
+```
+push_common(item, expires_at: Option<Instant>, expiry_channel, shutdown_channel)
+```
+
+Default send variants pass `None`; `push_common` then calculates `expires_at` from the configured
+ring TTL after it has accepted the item structurally. Per-item TTL variants validate the requested
+duration against the library TTL limits before locking the ring, calculate `Instant::now() + ttl`,
+and pass `Some(expires_at)` down. Per-item deadline variants validate only that the deadline is in
+the future before locking the ring, then pass `Some(deadline)` down directly. The ring does not
+enforce application-level reasonableness for future absolute deadlines.
+
+`push_common` remains responsible for universal structural checks and mutation: shutdown rejection,
+capacity rejection, deadline-order tracking, slot population, `tail` advancement, and `len`
+increment. It is the sole shutdown/full gate for all send variants. It resolves the configured TTL
+only when no caller-supplied deadline is present.
 
 #### Pop
 
@@ -107,25 +131,28 @@ increase leaves the flag unchanged.
 
 ### Deadline Monotonicity
 
-The ring tracks a `ttl_reduced` boolean alongside the other metadata. When clear, deadlines
-across occupied slots are guaranteed FIFO-monotonic: pushes computed under a non-decreasing TTL
-sequence always produce non-decreasing deadlines, and `peek_expires_at` and `drain_expired` use
-fast head-only paths.
+The ring tracks `ttl_reduced`, a non-monotonic-deadline flag meaning "occupied deadlines may be
+out of FIFO order." When clear, deadlines across occupied slots are guaranteed FIFO-monotonic, and
+`peek_expires_at` and `drain_expired` use fast head-only paths.
 
-When set, deadlines may not be FIFO-monotonic — a TTL reduction with items already in the ring
-followed by further pushes can produce later items with earlier deadlines. The flag is set by
-`set_ttl` only when the new TTL is strictly smaller than the current value AND the ring is
-non-empty. A reduction on an empty ring is harmless because future pushes will all use the new
-TTL. A TTL increase never sets the flag and never clears it: an increase cannot repair an
-already-non-monotonic ring (older items still hold their shorter deadlines).
+When set, deadlines may not be FIFO-monotonic. This can happen after a configured TTL reduction
+with items already in the ring, or after any valid per-item TTL/deadline send whose resolved
+deadline is earlier than the previously enqueued item's deadline. A reduction on an empty ring is
+harmless because future default sends will all use the new TTL. A configured TTL increase never
+sets the flag and never clears it: an increase cannot repair an already-non-monotonic ring.
+
+Every successful push must compare the resolved `expires_at` with the previous occupied tail slot
+when the ring is non-empty. If the new deadline is earlier, the flag is set before insertion
+completes. This keeps all send variants under one deadline-order invariant.
 
 The flag is cleared only by `drain_expired` after a full-scan walk observes that the survivors
 are FIFO-monotonic, or trivially when `len <= 1` after the drain. Once cleared, future sends
-preserve monotonicity until the next TTL reduction.
+preserve monotonicity until a configured TTL reduction or per-item expiry send introduces an
+earlier-than-tail deadline.
 
 While the flag is set, `peek_expires_at` returns the minimum deadline across all occupied slots,
-and `drain_expired` performs a full occupied-slot scan with conditional compaction. Both behave
-as before once the flag clears.
+and `drain_expired` performs a full occupied-slot scan with conditional compaction. After the flag
+clears, both methods use the FIFO-monotonic fast paths.
 
 #### Shutdown
 
@@ -134,8 +161,8 @@ as before once the flag clears.
 Sets the shutdown flag and extracts all remaining items in FIFO order. Each `PopResult` is
 populated with channel handles following the same mode rules as `try_pop`. After shutdown, the
 buffer is empty with `head` and `tail` reset to 0. The storage Vec is left at its current
-allocated size — shutdown is a terminal operation, so reallocating just to release the old Vec
-slightly earlier than the surrounding `Arc` would be net-negative work. Any pending deferred
+allocated size — shutdown is a terminal operation, so reallocating just to release the previous
+allocation slightly earlier than the surrounding `Arc` would be net-negative work. Any pending deferred
 shrink is therefore not honoured by `shutdown`. Calling shutdown on an already shut-down buffer
 returns an empty Vec.
 
@@ -172,7 +199,7 @@ Callers see a uniform interface regardless of mode.
   linearize, update metadata identically to growth.
 - **Deferred shrink** (`new < slots.len()` and `len > new`): set `target_capacity = new`. The
   buffer immediately stops accepting pushes beyond `target_capacity`. Compaction happens inside
-  `try_pop` or `shutdown` once `len` drops to `target_capacity`.
+  `try_pop` once `len` drops to `target_capacity`.
 - **No-op** (`new == slots.len()` and no pending shrink): nothing changes.
 
 Linearization moves all occupied slots into contiguous positions `0..len` in the new Vec,
@@ -215,6 +242,12 @@ preserving FIFO order. Each slot's complete metadata moves with the item.
 - `ttl_reduced` flag set by `set_ttl` on strict reduction with non-empty ring.
 - `ttl_reduced` flag not set by `set_ttl` on reduction with empty ring.
 - `ttl_reduced` flag not set by `set_ttl` on increase, and not cleared by `set_ttl` on increase.
+- Per-item TTL helper: valid TTL resolves to an absolute deadline; out-of-range TTL is rejected
+  before insertion.
+- Per-item expiry push: caller-supplied absolute deadlines are stored exactly as the slot's
+  `expires_at` without mutating the configured default TTL.
+- Per-item deadline helper: past or current deadline is rejected before insertion.
+- Per-item deadline ordering: a later push with an earlier deadline sets the non-monotonic flag.
 - `drain_expired` head-only fast path when flag is clear.
 - `drain_expired` full-scan path when flag is set: removes expired items in FIFO order, compacts
   if a gap was opened among survivors, and clears the flag if survivors are monotonic afterwards.

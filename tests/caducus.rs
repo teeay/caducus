@@ -291,6 +291,61 @@ async fn spsc_live_items_returned_after_expired() {
     assert_eq!(val, 2);
 }
 
+#[tokio::test]
+async fn spsc_send_with_ttl_expires_item_without_changing_default() {
+    let (tx, rx, expiry, _) = spsc_channel(4, DEFAULT_TTL);
+    tx.send_with_ttl(1, Duration::from_millis(20)).unwrap();
+    tx.send(2).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let val = rx
+        .next(Some(Instant::now() + Duration::from_millis(100)))
+        .await
+        .unwrap();
+    assert_eq!(val, 2);
+    assert_eq!(expiry.items(), vec![1]);
+}
+
+#[tokio::test]
+async fn spsc_send_with_deadline_keeps_fifo_for_live_items() {
+    let (tx, rx, _, _) = spsc_channel(4, DEFAULT_TTL);
+    tx.send_with_deadline(1, Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    tx.send_with_deadline(2, Instant::now() + Duration::from_secs(10))
+        .unwrap();
+
+    let first = rx
+        .next(Some(Instant::now() + Duration::from_millis(100)))
+        .await
+        .unwrap();
+    let second = rx
+        .next(Some(Instant::now() + Duration::from_millis(100)))
+        .await
+        .unwrap();
+
+    assert_eq!(first, 1);
+    assert_eq!(second, 2);
+}
+
+#[tokio::test]
+async fn spsc_send_with_invalid_ttl_returns_item() {
+    let (tx, _rx, _, _) = spsc_channel(4, DEFAULT_TTL);
+    let err = tx.send_with_ttl(7, Duration::ZERO).unwrap_err();
+    assert_eq!(err.clone().kind, CaducusErrorKind::InvalidTTL(7));
+    assert_eq!(err.into_inner(), Some(7));
+}
+
+#[tokio::test]
+async fn spsc_send_with_past_deadline_returns_item() {
+    let (tx, _rx, _, _) = spsc_channel(4, DEFAULT_TTL);
+    let err = tx
+        .send_with_deadline(7, Instant::now() - Duration::from_millis(1))
+        .unwrap_err();
+    assert_eq!(err.clone().kind, CaducusErrorKind::InvalidTTL(7));
+    assert_eq!(err.into_inner(), Some(7));
+}
+
 // ===========================================================================
 // SPSC: TTL and capacity updates
 // ===========================================================================
@@ -690,6 +745,211 @@ async fn mpsc_expiry_reports_to_per_sender_channel() {
     // Give reclaimer time.
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(expiry.items(), vec![1]);
+}
+
+#[tokio::test]
+async fn mpsc_send_with_ttl_preserves_sender_channel_snapshot() {
+    let expiry_a = CollectorChannel::<i32>::new();
+    let expiry_b = CollectorChannel::<i32>::new();
+    let (tx, rx, _, _) = mpsc_channel_with_reports(4, DEFAULT_TTL);
+
+    tx.set_expiry_channel(Some(expiry_a.clone()));
+    let tx2 = tx.clone();
+    tx.set_expiry_channel(Some(expiry_b.clone()));
+
+    tx.send_with_ttl(10, Duration::from_millis(20)).unwrap();
+    tx2.send_with_ttl(20, Duration::from_millis(20)).unwrap();
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(expiry_a.items(), vec![20]);
+    assert_eq!(expiry_b.items(), vec![10]);
+    drop(rx);
+}
+
+#[tokio::test]
+async fn mpsc_send_with_deadline_wakes_reclaimer_for_later_earlier_deadline() {
+    let expiry = CollectorChannel::<i32>::new();
+    let (tx, rx) = mpsc_channel(4, DEFAULT_TTL);
+    tx.set_expiry_channel(Some(expiry.clone()));
+
+    tx.send_with_deadline(1, Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    // Let the reclaimer observe the long-deadline item and go to sleep on
+    // that far-future deadline. The next send must wake it to re-evaluate.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tx.send_with_deadline(2, Instant::now() + Duration::from_millis(20))
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            if expiry.items() == vec![2] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("short-deadline non-head item should be reclaimed promptly");
+
+    assert_eq!(expiry.items(), vec![2]);
+    let live = rx
+        .next(Some(Instant::now() + Duration::from_millis(100)))
+        .await
+        .unwrap();
+    assert_eq!(live, 1);
+}
+
+#[tokio::test]
+async fn concurrent_mpsc_per_item_sends_preserve_clone_channel_snapshots() {
+    let expiry_channels: Vec<_> = (0..4).map(|_| CollectorChannel::<i32>::new()).collect();
+    let shutdown_channels: Vec<_> = (0..4).map(|_| CollectorChannel::<i32>::new()).collect();
+    let (tx, _rx) = mpsc_channel(512, DEFAULT_TTL);
+    let mut handles = Vec::new();
+
+    for sender_id in 0..4 {
+        let sender = tx.clone();
+        let expiry = expiry_channels[sender_id].clone();
+        let shutdown = shutdown_channels[sender_id].clone();
+        handles.push(tokio::spawn(async move {
+            sender.set_channels(Some(expiry), Some(shutdown));
+            for i in 0..50 {
+                let value = (sender_id as i32) * 1000 + i;
+                if i % 2 == 0 {
+                    sender
+                        .send_with_ttl(value, Duration::from_millis(20))
+                        .unwrap();
+                } else {
+                    sender
+                        .send_with_deadline(value, Instant::now() + Duration::from_millis(20))
+                        .unwrap();
+                }
+                if i % 7 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let expired: usize = expiry_channels.iter().map(|ch| ch.len()).sum();
+            if expired == 200 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all short per-item sends should expire");
+
+    for (sender_id, channel) in expiry_channels.iter().enumerate() {
+        let items = channel.items();
+        assert_eq!(items.len(), 50);
+        assert!(
+            items.iter().all(|value| *value >= (sender_id as i32) * 1000
+                && *value < (sender_id as i32) * 1000 + 50),
+            "sender {sender_id} expiry channel received unexpected items: {items:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mixed_per_item_mpsc_conservation_under_capacity_updates() {
+    let (tx, rx, expiry, shutdown) = mpsc_channel_with_reports(256, DEFAULT_TTL);
+    let sent = Arc::new(AtomicUsize::new(0));
+    let received = Arc::new(AtomicUsize::new(0));
+
+    let received_count = received.clone();
+    let receiver = tokio::spawn(async move {
+        loop {
+            match rx
+                .next(Some(Instant::now() + Duration::from_millis(50)))
+                .await
+            {
+                Ok(_) => {
+                    received_count.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(e) if e.kind == CaducusErrorKind::Timeout => {}
+                Err(e) if e.kind == CaducusErrorKind::Shutdown(()) => break,
+                Err(e) => panic!("unexpected receive error: {e}"),
+            }
+        }
+    });
+
+    tx.send_with_deadline(10_000, Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    tx.send_with_deadline(10_001, Instant::now() + Duration::from_millis(20))
+        .unwrap();
+    sent.fetch_add(2, Ordering::Relaxed);
+
+    let capacity_sender = tx.clone();
+    let capacity_task = tokio::spawn(async move {
+        for i in 0..80 {
+            capacity_sender.update_capacity(if i % 2 == 0 { 64 } else { 256 });
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let mut senders = Vec::new();
+    for sender_id in 0..4 {
+        let sender = tx.clone();
+        let sent_count = sent.clone();
+        senders.push(tokio::spawn(async move {
+            for i in 0..60 {
+                let value = sender_id * 1000 + i;
+                let result = match i % 3 {
+                    0 => sender.send_with_ttl(value, Duration::from_millis(8)),
+                    1 => {
+                        sender.send_with_deadline(value, Instant::now() + Duration::from_millis(12))
+                    }
+                    _ => sender.send(value),
+                };
+                if result.is_ok() {
+                    sent_count.fetch_add(1, Ordering::Relaxed);
+                }
+                if i % 5 == 0 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }));
+    }
+
+    for sender in senders {
+        sender.await.unwrap();
+    }
+    capacity_task.await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tx.shutdown();
+    receiver.await.unwrap();
+
+    let accounted = received.load(Ordering::Relaxed) + expiry.len() + shutdown.len();
+    assert_eq!(sent.load(Ordering::Relaxed), accounted);
+}
+
+#[tokio::test]
+async fn mpsc_send_with_invalid_ttl_returns_item() {
+    let (tx, _rx) = mpsc_channel(4, DEFAULT_TTL);
+    let err = tx.send_with_ttl(7, Duration::ZERO).unwrap_err();
+    assert_eq!(err.clone().kind, CaducusErrorKind::InvalidTTL(7));
+    assert_eq!(err.into_inner(), Some(7));
+}
+
+#[tokio::test]
+async fn mpsc_send_with_past_deadline_returns_item() {
+    let (tx, _rx) = mpsc_channel(4, DEFAULT_TTL);
+    let err = tx
+        .send_with_deadline(7, Instant::now() - Duration::from_millis(1))
+        .unwrap_err();
+    assert_eq!(err.clone().kind, CaducusErrorKind::InvalidTTL(7));
+    assert_eq!(err.into_inner(), Some(7));
 }
 
 // ===========================================================================

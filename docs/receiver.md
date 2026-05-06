@@ -26,8 +26,8 @@ concurrency layer and the receiver's `Notify` handle.
 
 **`next(deadline: Option<Instant>) -> Result<T, CaducusError>`**
 
-This is the only way data leaves the channel for the caller. It returns the owned `T`, never
-internal types. The receiver owns the wait loop and timeout logic.
+This is the only way data leaves the channel for the caller. It returns the owned `T`. The
+receiver owns the wait loop and timeout logic.
 
 Passing `None` uses `DEFAULT_RECEIVE_TIMEOUT` (1 second). `None` does not mean wait indefinitely.
 

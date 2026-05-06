@@ -7,11 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::{CaducusError, CaducusErrorKind};
 
-/// Process-wide sentinel `Instant` used as the placeholder expiry deadline for
-/// empty slots. Lazily initialised on the first ring construction in the
-/// process. Because `Instant::now()` at first init always precedes any later
-/// `now`, the sentinel sorts as "in the past" for all later expiry comparisons.
-/// It is never read on occupied slots and never compared as a real deadline.
+// Process-wide placeholder expiry deadline for empty slots. It is never read
+// on occupied slots or compared as a real deadline.
 static SLOT_SENTINEL: OnceLock<Instant> = OnceLock::new();
 
 fn slot_sentinel() -> Instant {
@@ -24,26 +21,20 @@ fn slot_sentinel() -> Instant {
 /// or remained in the buffer at shutdown. The implementation must not panic;
 /// the reclaimer invokes `send` under unwind isolation, but a panicking
 /// implementation will still drop the item.
-///
-/// Defined here so storage can hold handles without depending on sender
-/// internals. The storage layer stores these handles but never calls them.
 pub trait ReportChannel<T>: Send + Sync + 'static {
     /// Hands the item to the report sink. Returns the item back as `Err` if
     /// the sink cannot accept it (e.g. closed).
     fn send(&self, item: T) -> Result<(), T>;
 }
 
-/// Operating mode, set at construction and immutable.
+// Operating mode, set at construction and immutable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChannelMode {
     Spsc,
     Mpsc,
 }
 
-/// Result of popping or draining an item from the ring buffer.
-///
-/// Carries the extracted payload and all associated metadata so the caller
-/// can make reporting decisions after the item has left storage.
+// Result of popping or draining an item from the ring buffer.
 pub(crate) struct PopResult<T> {
     pub item: T,
     pub expires_at: Instant,
@@ -68,10 +59,8 @@ impl<T: std::fmt::Debug> std::fmt::Debug for PopResult<T> {
     }
 }
 
-/// A single slot in the ring buffer.
-///
-/// The slot structure is identical in both modes for predictable memory use.
-/// Only the payload (`item`) uses move semantics via `Option<T>`.
+// A single slot in the ring buffer. The layout is identical in both modes so
+// memory use is predictable.
 struct Slot<T> {
     item: Option<T>,
     expires_at: Instant,
@@ -116,11 +105,7 @@ impl<T> Slot<T> {
     }
 }
 
-/// Vec-backed circular buffer for bounded channel storage.
-///
-/// All operations are synchronous. The buffer knows nothing about wakeups,
-/// notifications, or async. Concurrency protection is the caller's
-/// responsibility.
+// Vec-backed circular buffer for bounded channel storage.
 pub(crate) struct Ring<T> {
     slots: Vec<Slot<T>>,
     head: usize,
@@ -132,11 +117,9 @@ pub(crate) struct Ring<T> {
     mode: ChannelMode,
     expiry_channel: Option<Arc<dyn ReportChannel<T>>>,
     shutdown_channel: Option<Arc<dyn ReportChannel<T>>>,
-    /// True when the deadlines across occupied slots may be non-monotonic in
-    /// FIFO order. Set by `set_ttl` only when the new TTL is strictly smaller
-    /// than the current value AND the ring is non-empty. Cleared only by
-    /// `drain_expired` after observing monotonic survivors. Never cleared by
-    /// `set_ttl`: a TTL increase cannot repair an already-non-monotonic ring.
+    // True when deadlines across occupied slots may be non-monotonic in FIFO
+    // order. Set by `set_ttl` on a TTL reduction while non-empty; cleared by
+    // `drain_expired` after observing monotonic survivors.
     ttl_reduced: bool,
 }
 
@@ -144,11 +127,8 @@ impl<T> Ring<T> {
     pub(crate) const MIN_TTL: Duration = Duration::from_millis(1);
     pub(crate) const MAX_TTL: Duration = Duration::from_secs(365 * 24 * 60 * 60);
 
-    /// Creates a new ring buffer with the given capacity, TTL, mode, and
-    /// ring-level channels.
-    ///
-    /// Capacity is clamped to a minimum of 1. TTL must be within the inclusive
-    /// range 1ms..=1 year.
+    // Creates a ring buffer with the given capacity, TTL, mode, and ring-level
+    // channels.
     pub fn new(
         capacity: usize,
         ttl: Duration,
@@ -177,23 +157,31 @@ impl<T> Ring<T> {
         })
     }
 
-    /// SPSC push. Rejects with `InvalidPattern(item)` in MPSC mode.
-    ///
-    /// Populates the slot with `None` for both per-slot channel fields.
-    /// Computes `expires_at` from the ring's own TTL.
+    // SPSC push. Rejects with `InvalidPattern(item)` in MPSC mode.
     pub fn try_push_spsc(&mut self, item: T) -> Result<(), CaducusError<T>> {
         if self.mode != ChannelMode::Spsc {
             return Err(CaducusError {
                 kind: CaducusErrorKind::InvalidPattern(item),
             });
         }
-        self.push_common(item, None, None)
+        self.push_common(item, None, None, None)
     }
 
-    /// MPSC push. Rejects with `InvalidPattern(item)` in SPSC mode.
-    ///
-    /// Populates the slot with the provided per-slot channel handles.
-    /// Computes `expires_at` from the ring's own TTL.
+    // SPSC push using a caller-validated absolute expiry deadline.
+    pub fn try_push_spsc_with_expires_at(
+        &mut self,
+        item: T,
+        expires_at: Instant,
+    ) -> Result<(), CaducusError<T>> {
+        if self.mode != ChannelMode::Spsc {
+            return Err(CaducusError {
+                kind: CaducusErrorKind::InvalidPattern(item),
+            });
+        }
+        self.push_common(item, Some(expires_at), None, None)
+    }
+
+    // MPSC push. Rejects with `InvalidPattern(item)` in SPSC mode.
     pub fn try_push_mpsc(
         &mut self,
         item: T,
@@ -205,13 +193,31 @@ impl<T> Ring<T> {
                 kind: CaducusErrorKind::InvalidPattern(item),
             });
         }
-        self.push_common(item, expiry_channel, shutdown_channel)
+        self.push_common(item, None, expiry_channel, shutdown_channel)
     }
 
-    /// Shared push logic: checks shutdown/full, computes expiry, populates slot.
+    // MPSC push using a caller-validated absolute expiry deadline.
+    pub fn try_push_mpsc_with_expires_at(
+        &mut self,
+        item: T,
+        expires_at: Instant,
+        expiry_channel: Option<Arc<dyn ReportChannel<T>>>,
+        shutdown_channel: Option<Arc<dyn ReportChannel<T>>>,
+    ) -> Result<(), CaducusError<T>> {
+        if self.mode != ChannelMode::Mpsc {
+            return Err(CaducusError {
+                kind: CaducusErrorKind::InvalidPattern(item),
+            });
+        }
+        self.push_common(item, Some(expires_at), expiry_channel, shutdown_channel)
+    }
+
+    // Shared push logic. `None` means use the configured default TTL; `Some`
+    // is a caller-validated absolute expiry deadline.
     fn push_common(
         &mut self,
         item: T,
+        expires_at: Option<Instant>,
         expiry_channel: Option<Arc<dyn ReportChannel<T>>>,
         shutdown_channel: Option<Arc<dyn ReportChannel<T>>>,
     ) -> Result<(), CaducusError<T>> {
@@ -225,23 +231,58 @@ impl<T> Ring<T> {
                 kind: CaducusErrorKind::Full(item),
             });
         }
-        let now = Instant::now();
-        let expires_at = now
-            .checked_add(self.ttl())
-            .or_else(|| now.checked_add(Self::MIN_TTL))
-            .unwrap_or(now);
+        let expires_at = expires_at.unwrap_or_else(|| self.default_expires_at());
+        self.track_deadline_order(expires_at);
         self.slots[self.tail].populate(item, expires_at, expiry_channel, shutdown_channel);
         self.tail = (self.tail + 1) % self.slots.len();
         self.len += 1;
         Ok(())
     }
 
-    /// Removes and returns the head item with its metadata.
-    ///
-    /// In SPSC mode, the returned `PopResult` is populated with clones of the
-    /// ring-level channel handles. In MPSC mode, per-slot handles are used.
-    /// Returns `None` if the buffer is empty. If a deferred shrink is pending
-    /// and occupancy has dropped to target capacity, the buffer compacts.
+    fn default_expires_at(&self) -> Instant {
+        // Unreachable in normal operation: `self.ttl()` always clamps into
+        // the valid range before calling `expires_at_from_ttl`.
+        Self::expires_at_from_ttl(self.ttl()).unwrap_or_else(|()| self.fallback_expires_at())
+    }
+
+    pub(crate) fn expires_at_from_ttl(ttl: Duration) -> Result<Instant, ()> {
+        if !(Self::MIN_TTL..=Self::MAX_TTL).contains(&ttl) {
+            return Err(());
+        }
+        let now = Instant::now();
+        Ok(now
+            .checked_add(ttl)
+            .or_else(|| now.checked_add(Self::MIN_TTL))
+            .unwrap_or(now))
+    }
+
+    fn fallback_expires_at(&self) -> Instant {
+        let now = Instant::now();
+        now.checked_add(Self::MIN_TTL).unwrap_or(now)
+    }
+
+    pub(crate) fn validate_deadline(deadline: Instant) -> Result<Instant, ()> {
+        if deadline <= Instant::now() {
+            return Err(());
+        }
+        Ok(deadline)
+    }
+
+    fn track_deadline_order(&mut self, expires_at: Instant) {
+        if self.len == 0 {
+            return;
+        }
+        let previous_tail = if self.tail == 0 {
+            self.slots.len() - 1
+        } else {
+            self.tail - 1
+        };
+        if expires_at < self.slots[previous_tail].expires_at {
+            self.ttl_reduced = true;
+        }
+    }
+
+    // Removes and returns the head item with its metadata.
     pub fn try_pop(&mut self) -> Option<PopResult<T>> {
         if self.len == 0 {
             return None;
@@ -261,13 +302,8 @@ impl<T> Ring<T> {
         result
     }
 
-    /// Returns the soonest expiry deadline among occupied slots, or `None`
-    /// when empty.
-    ///
-    /// When `ttl_reduced` is clear, deadlines are FIFO-monotonic and the head
-    /// is always the soonest. When `ttl_reduced` is set, deadlines may be
-    /// non-monotonic; this method scans all occupied slots and returns the
-    /// minimum. The flag is not mutated here — only `drain_expired` clears it.
+    // Returns the soonest expiry deadline among occupied slots, or `None`
+    // when empty.
     pub fn peek_expires_at(&self) -> Option<Instant> {
         if self.len == 0 {
             return None;
@@ -287,14 +323,7 @@ impl<T> Ring<T> {
         Some(min_deadline)
     }
 
-    /// Pops expired items and returns them in FIFO order.
-    ///
-    /// When `ttl_reduced` is clear, scans only the contiguous expired head
-    /// prefix and stops at the first live head — no compaction needed. When
-    /// the flag is set, scans every occupied slot, removes expired items in
-    /// FIFO order, compacts via `linearize(target_capacity)` if a gap was
-    /// opened among survivors, and clears the flag if the survivors are then
-    /// FIFO-monotonic.
+    // Pops expired items and returns them in FIFO order.
     pub fn drain_expired(&mut self, now: Instant) -> Vec<PopResult<T>> {
         if !self.ttl_reduced {
             // Fast path: contiguous head prefix only.
@@ -397,11 +426,7 @@ impl<T> Ring<T> {
         items
     }
 
-    /// Sets the shutdown flag and extracts all remaining items in FIFO order.
-    ///
-    /// Each `PopResult` is populated with channel handles following the same
-    /// mode rules as `try_pop`. Calling shutdown on an already shut-down
-    /// buffer returns an empty Vec.
+    // Sets the shutdown flag and extracts all remaining items in FIFO order.
     pub fn shutdown(&mut self) -> Vec<PopResult<T>> {
         if self.shutdown {
             return Vec::new();
@@ -428,20 +453,12 @@ impl<T> Ring<T> {
         self.shutdown
     }
 
-    /// Returns the current TTL.
+    // Returns the current TTL.
     pub fn ttl(&self) -> Duration {
         self.ttl.clamp(Self::MIN_TTL, Self::MAX_TTL)
     }
 
-    /// Updates the TTL. Future pushes use the new value.
-    ///
-    /// When the new TTL is strictly smaller than the current value AND the
-    /// ring is non-empty, sets the `ttl_reduced` flag because subsequent
-    /// pushes will produce deadlines smaller than those of items already in
-    /// the ring, breaking FIFO-monotonicity. If the ring is empty, no
-    /// existing deadlines are at risk so the flag stays clear. A TTL increase
-    /// never sets the flag and never clears it (an increase cannot repair an
-    /// already-non-monotonic ring; it must wait for offending items to drain).
+    // Updates the TTL. Future pushes use the new value.
     pub fn set_ttl(&mut self, ttl: Duration) -> Result<(), CaducusError> {
         Self::validate_ttl(ttl)?;
         if ttl < self.ttl && self.len > 0 {
@@ -451,10 +468,7 @@ impl<T> Ring<T> {
         Ok(())
     }
 
-    /// Requests a new capacity. Clamped to a minimum of 1.
-    ///
-    /// Growth reallocates immediately. Shrink reallocates immediately if
-    /// occupancy allows, otherwise defers until pops bring occupancy down.
+    // Requests a new capacity. Clamped to a minimum of 1.
     pub fn request_capacity(&mut self, new: usize) {
         let new = new.max(1);
         let current = self.slots.len();
@@ -478,23 +492,19 @@ impl<T> Ring<T> {
         }
     }
 
-    /// Whether deferred compaction should run.
+    // Whether deferred compaction should run.
     fn should_compact(&self) -> bool {
         self.target_capacity < self.slots.len() && self.len <= self.target_capacity
     }
 
-    /// Compacts the buffer to target_capacity by linearizing into a new Vec.
+    // Compacts the buffer to target_capacity by linearizing into a new Vec.
     fn compact(&mut self) {
         self.linearize(self.target_capacity);
     }
 
-    /// Linearizes occupied slots into a new Vec of the given size,
-    /// preserving FIFO order. Resets head to 0 and tail to len.
-    ///
-    /// Precondition: the first `self.len` slots from `self.head` must all be
-    /// occupied. Callers that may have introduced gaps (e.g. the gap-aware
-    /// drain in `drain_expired`) must perform their own gap-tolerant
-    /// compaction instead of calling this helper.
+    // Linearizes occupied slots into a new Vec of the given size, preserving
+    // FIFO order. Requires the first `self.len` slots from `self.head` to be
+    // occupied.
     fn linearize(&mut self, new_capacity: usize) {
         let mut new_slots = Vec::with_capacity(new_capacity);
         let old_len = self.slots.len();

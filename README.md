@@ -11,7 +11,7 @@ The author hopes others find additional use cases.
 - Aims for high throughput
 - Expired items drained on expiry (not on next receiver pop)
 - Sender is responsible for handling returned items (no expiry/shutdown retries)
-- Aims to be panick free and panick resistant
+- Aims to be panic-free and panic-resistant
 
 ## Install
 

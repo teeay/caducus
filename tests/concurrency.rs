@@ -492,6 +492,85 @@ async fn update_ttl_does_not_affect_existing_items() {
     assert!(live.expires_at <= expected_max);
 }
 
+#[tokio::test]
+async fn send_mpsc_with_ttl_uses_item_ttl_without_mutating_default() {
+    let inner = Arc::new(make_ring(4, Duration::from_secs(60)));
+    let item_ttl = Duration::from_millis(20);
+    let before = Instant::now();
+    let expires_at = concurrency::expires_at_from_ttl(item_ttl).unwrap();
+    inner
+        .send_mpsc_with_expires_at(1, expires_at, None, None)
+        .expect("per-item TTL send should succeed");
+    let after = Instant::now();
+
+    let result = inner.drain(Instant::now(), DrainMode::DrainAndClaim);
+    let live = result.live.expect("item should be claimed");
+    assert_eq!(live.item, 1);
+    assert!(live.expires_at >= before + item_ttl);
+    assert!(live.expires_at <= after + item_ttl);
+
+    let default_before = Instant::now();
+    inner
+        .send_mpsc(2, None, None)
+        .expect("default send should succeed");
+    let default_after = Instant::now();
+    let result = inner.drain(Instant::now(), DrainMode::DrainAndClaim);
+    let live = result.live.expect("default item should be claimed");
+    assert_eq!(live.item, 2);
+    assert!(live.expires_at >= default_before + Duration::from_secs(60));
+    assert!(live.expires_at <= default_after + Duration::from_secs(60));
+}
+
+#[tokio::test]
+async fn per_item_ttl_validation_rejects_out_of_range_duration() {
+    assert!(concurrency::expires_at_from_ttl(Duration::ZERO).is_err());
+}
+
+#[tokio::test]
+async fn send_mpsc_with_deadline_sets_next_deadline_to_minimum() {
+    let inner = make_ring(4, DEFAULT_TTL);
+    let first_deadline = Instant::now() + Duration::from_secs(60);
+    let second_deadline = Instant::now() + Duration::from_secs(10);
+
+    inner
+        .send_mpsc_with_expires_at(1, first_deadline, None, None)
+        .expect("first deadline send should succeed");
+    inner
+        .send_mpsc_with_expires_at(2, second_deadline, None, None)
+        .expect("second deadline send should succeed");
+
+    let result = inner.drain(Instant::now(), DrainMode::DrainOnly);
+    assert!(result.expired.is_empty());
+    assert_eq!(result.next_deadline, Some(second_deadline));
+}
+
+#[tokio::test]
+async fn per_item_deadline_validation_rejects_past_deadline() {
+    assert!(concurrency::validate_deadline(Instant::now() - Duration::from_millis(1)).is_err());
+}
+
+#[tokio::test]
+async fn send_spsc_per_item_variants_delegate_to_ring() {
+    let inner = make_spsc_ring(4, DEFAULT_TTL, None, None);
+    let item_ttl = Duration::from_millis(20);
+    let expires_at = concurrency::expires_at_from_ttl(item_ttl).unwrap();
+    inner
+        .send_spsc_with_expires_at(1, expires_at)
+        .expect("per-item SPSC TTL send should succeed");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    inner
+        .send_spsc_with_expires_at(2, deadline)
+        .expect("per-item SPSC deadline send should succeed");
+
+    let first = inner.drain(Instant::now(), DrainMode::DrainAndClaim);
+    assert_eq!(first.live.unwrap().item, 1);
+    let second = inner.drain(Instant::now(), DrainMode::DrainAndClaim);
+    let live = second.live.expect("second item should be claimed");
+    assert_eq!(live.item, 2);
+    assert_eq!(live.expires_at, deadline);
+}
+
 // ---------------------------------------------------------------------------
 // Capacity update
 // ---------------------------------------------------------------------------

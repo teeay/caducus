@@ -10,6 +10,8 @@ Status: Developed
 - Keep the implementation split into storage, concurrency, reclaimer, sender, and receiver layers.
 - Use a mutex-based architecture with Vec-backed ring buffer storage.
 - Report expiry and shutdown outcomes through sender-owned report channels.
+- Support per-item expiry sends that can override the configured default TTL with either a
+  validated per-send TTL or a future absolute deadline.
 
 ## Technical Details
 
@@ -22,9 +24,10 @@ that module's behaviour.
 
 `src/concurrency/ring_buffer.rs`, private submodule of the concurrency module.
 
-The ring buffer is the single authority for all accounting data and its validity. No upper layer
-computes, transforms, or second-guesses ring buffer data. Upper layers query ring state and pass
-configuration values which the ring validates and applies.
+The ring buffer is the single authority for stored queue accounting data and its validity. Default
+sends let the ring calculate expiry from the configured TTL. Per-item send variants validate their
+caller-supplied TTL or deadline before locking the ring and pass the resolved absolute deadline
+down for storage. Upper layers do not inspect or rewrite occupied ring state.
 
 See `docs/ring-buffer.md` for structure, operations, and validation.
 
@@ -37,7 +40,11 @@ parameter is `()`.
 
 `CaducusErrorKind<T>` variants:
 
-- `InvalidArgument` -- invalid configuration value (e.g. TTL out of range).
+- `InvalidArgument` -- invalid non-send argument or configuration value (e.g. configured TTL out
+  of range).
+- `InvalidTTL(T)` -- invalid per-send TTL or deadline. Carries the rejected item. Used when
+  `send_with_ttl` receives a duration outside `1ms..=1 year`, or `send_with_deadline` receives a
+  deadline at or before validation time.
 - `InvalidPattern(T)` -- wrong push variant for the configured mode. Carries the rejected item.
 - `Timeout` -- blocking pop deadline reached.
 - `Shutdown(T)` -- queue has been shut down. Carries the rejected item on the send path; carries
@@ -46,10 +53,12 @@ parameter is `()`.
 - `NoRuntime` -- no Tokio runtime available when `build()` is called.
 
 The send path returns `Result<(), CaducusError<T>>` so the caller always gets the item back on
-failure. The receive path and configuration methods return `Result<..., CaducusError<()>>`.
+failure. This guarantee also applies to per-item expiry sends that fail validation with
+`InvalidTTL(item)`, such as an out-of-range per-send TTL or a deadline that is not in the future.
+The receive path and configuration methods return `Result<..., CaducusError<()>>`.
 
-`CaducusError<T>::into_inner()` returns `Option<T>`, extracting the item from `Full`, `Shutdown`,
-or `InvalidPattern` variants.
+`CaducusError<T>::into_inner()` returns `Option<T>`, extracting the item from item-carrying send
+errors: `Full`, `Shutdown`, `InvalidTTL`, and `InvalidPattern`.
 
 #### Concurrency — Serialised Access And Wakeup Coordination
 
@@ -112,16 +121,26 @@ Two builders produce mode-specific sender types. Both take `new(capacity, ttl)` 
 
 `SpscSender<T>` -- not cloneable, report channels (if configured) fixed at construction at ring
 level. Unconfigured channels result in silent drop of the corresponding outcome.
-Methods: `send(item)`, `update_capacity`, `update_ttl`, `shutdown`, `is_closed`.
+Methods: `send(item)`, `send_with_ttl(item, ttl)`, `send_with_deadline(item, deadline)`,
+`update_capacity`, `update_ttl`, `shutdown`, `is_closed`.
 
 `MpscSender<T>` -- cloneable, each clone captures a snapshot of the current report channels.
-Methods: `send(item)`, `set_expiry_channel`, `set_shutdown_channel`, `set_channels`,
-`update_capacity`, `update_ttl`, `shutdown`, `is_closed`.
+Methods: `send(item)`, `send_with_ttl(item, ttl)`, `send_with_deadline(item, deadline)`,
+`set_expiry_channel`, `set_shutdown_channel`, `set_channels`, `update_capacity`, `update_ttl`,
+`shutdown`, `is_closed`.
+
+Default `send(item)` uses the configured channel TTL. `send_with_ttl` validates the supplied
+duration against the library TTL limits. `send_with_deadline` rejects deadlines at or before
+validation time and otherwise accepts caller-supplied future deadlines without applying library TTL
+limits. Per-item expiry sends do not change the configured default TTL used by later `send(item)`
+calls. Receive delivery remains FIFO; per-item expiry does not provide earliest-deadline-first,
+priority, or fair scheduling.
 
 `Receiver<T>` -- mode-agnostic, single consumer.
 Methods: `next(deadline: Option<Instant>)`, `is_closed`.
 
-Error variants: `InvalidArgument`, `InvalidPattern`, `NoRuntime`, `Timeout`, `Shutdown`, `Full`.
+Error variants: `InvalidArgument`, `InvalidTTL`, `InvalidPattern`, `NoRuntime`, `Timeout`,
+`Shutdown`, `Full`.
 Full API detail lives in the sender and receiver docs.
 
 ### Conservation Invariant

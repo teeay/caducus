@@ -13,8 +13,6 @@ use crate::reclaimer;
 const DEFAULT_RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Single-consumer receiver. Not cloneable. Mode-agnostic.
-///
-/// `next` returns the owned `T`, never internal types.
 pub struct Receiver<T: Send + 'static> {
     ring: Arc<ConcurrentRing<T>>,
     notify: Arc<tokio::sync::Notify>,

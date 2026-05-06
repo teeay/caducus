@@ -7,6 +7,8 @@ Status: Developed
 - Define sender behavior for the bounded asynchronous channel.
 - Support two distinct sender types: `SpscSender<T>` (not cloneable) and `MpscSender<T>`
   (cloneable with channel snapshot semantics).
+- Add per-item expiry send variants that allow callers to override the configured default TTL for
+  individual sends.
 
 ## Technical Details
 
@@ -25,11 +27,12 @@ set the ring-level report channels. When a channel is not configured, the corres
 **`MpscBuilder<T>::new(capacity, ttl)`**
 
 Configures an MPSC queue. Optional methods `expiry_channel(...)` and `shutdown_channel(...)` set the
-initial sender-local report channels. These become the default channels on the first
-`MpscSender<T>` and are copied to each subsequent clone.
+initial sender-local report channels. The first `MpscSender<T>` uses these channels, and each
+subsequent clone snapshots the channels configured on the source sender at clone time.
 
-The SPSC vs MPSC difference is now only "ring-level handle vs sender-local handle", not
-"required vs optional".
+SPSC stores report channels at ring level. MPSC stores report channels on each sender and copies
+them into each item at send time. In both modes, absent channels silently drop the corresponding
+expiry or shutdown outcome.
 
 Both builders accept an optional Tokio runtime handle via `runtime(handle)`. If not provided,
 `build()` calls `Handle::try_current()` to obtain the ambient runtime.
@@ -78,12 +81,14 @@ Both sender types expose a plain `send(item)` method. The internal delegation di
 
 1. Calls `ConcurrentRing::send_spsc(item)`.
 2. Concurrency layer: acquires mutex, calls `Ring::try_push_spsc(item)`.
-3. Ring buffer: validates mode is SPSC (otherwise `InvalidPattern(item)`), then `push_common`.
-4. `push_common`: rejects if shutdown (`Shutdown(item)`) or full (`Full(item)`). Computes
-   `expires_at = now + ttl`. Writes item, expiry, and `None` for both per-slot channel fields into
-   the slot at `tail`. Advances `tail`, increments `len`.
-5. Concurrency layer: releases mutex, notifies both reclaimer and receiver.
-6. Returns `Ok(())` to the caller. On any error, the item is returned inside the error variant.
+3. Ring buffer: validates mode is SPSC (otherwise `InvalidPattern(item)`).
+4. Ring buffer: calls `push_common` with no supplied deadline.
+5. `push_common`: rejects if shutdown (`Shutdown(item)`) or full (`Full(item)`), resolves
+   `expires_at = now + configured ttl`, tracks deadline
+   ordering, writes item, expiry, and `None` for both per-slot channel fields into the slot at
+   `tail`, advances `tail`, and increments `len`.
+6. Concurrency layer: releases mutex, notifies both reclaimer and receiver.
+7. Returns `Ok(())` to the caller. On any error, the item is returned inside the error variant.
 
 **`MpscSender::send(item) -> Result<(), CaducusError<T>>`**
 
@@ -91,17 +96,63 @@ Both sender types expose a plain `send(item)` method. The internal delegation di
 2. Calls `ConcurrentRing::send_mpsc(item, expiry_channel, shutdown_channel)`.
 3. Concurrency layer: acquires mutex, calls `Ring::try_push_mpsc(item, expiry_channel,
    shutdown_channel)`.
-4. Ring buffer: validates mode is MPSC (otherwise `InvalidPattern(item)`), then `push_common`.
-5. `push_common`: same checks as SPSC. Writes item, expiry, and the provided per-slot channel
-   handles into the slot at `tail`. Advances `tail`, increments `len`.
+4. Ring buffer: validates mode is MPSC (otherwise `InvalidPattern(item)`), then calls
+   `push_common` with no supplied deadline.
+5. `push_common`: same checks as SPSC. Resolves `expires_at = now + configured ttl`, tracks
+   deadline ordering, writes item, expiry, and the
+   provided per-slot channel handles into the slot at `tail`, advances `tail`, and increments
+   `len`.
 6. Concurrency layer: releases mutex, notifies both reclaimer and receiver.
 7. Returns `Ok(())` to the caller. On any error, the item is returned inside the error variant.
+
+### Per-Item Expiry Send
+
+Both sender types expose per-item expiry variants alongside the default `send(item)`:
+
+```
+send_with_ttl(item, ttl: Duration) -> Result<(), CaducusError<T>>
+send_with_deadline(item, deadline: Instant) -> Result<(), CaducusError<T>>
+```
+
+`send(item)` remains the default path and uses the channel's configured TTL. `send_with_ttl`
+validates `ttl` against the same library limits as builder construction and `update_ttl`
+(`1ms..=1 year`). Values outside that range reject the send with `InvalidTTL(item)` and must
+return the rejected item to the caller.
+
+`send_with_deadline` accepts any future `Instant`, without applying the configured TTL limits. A
+deadline that is at or before the validation-time `Instant::now()` rejects the send with an
+`InvalidTTL(item)` and must return the rejected item to the caller. The system does not otherwise
+judge whether an absolute deadline is sensible for the application; it only rejects deadlines that
+would already be expired if enqueued. A valid future deadline may be arbitrarily far in the future;
+that is caller policy.
+
+The sender layer validates per-item TTLs and deadlines before taking the ring mutex. In MPSC mode,
+validation also happens before report-channel snapshot locks are taken, so invalid per-item sends
+do not serialise behind either the channel configuration locks or the ring mutex. A valid per-item
+TTL is converted to an absolute `expires_at: Instant`; a valid deadline is passed through as that
+same absolute deadline.
+
+The ring exposes one shared insertion primitive with an optional deadline. `None` means use the
+configured default TTL; `Some(expires_at)` means use the caller-supplied expiry that the sender
+already validated. The ring remains the single shutdown/full gate and performs those checks exactly
+once after the mode-specific push variant has selected the insertion path.
+
+SPSC and MPSC must expose equivalent per-item expiry APIs. MPSC variants keep the existing
+sender-local report-channel snapshot semantics: after resolving and validating the deadline, the
+sender snapshots its current expiry and shutdown channels and stores those handles with the item at
+send time.
+
+Per-item expiry does not make Caducus a fairness scheduler. Receive delivery remains strictly FIFO:
+the receiver claims the oldest live item, not the item with the earliest expiry deadline. The
+reclaimer may remove expired non-head items when deadlines are non-monotonic, but live items are
+not reordered by expiry. Callers that need earliest-deadline-first, priority, or fair scheduling
+must implement that policy before sending into Caducus.
 
 ### Report Channel Configuration
 
 `set_expiry_channel(ch)` and `set_shutdown_channel(ch)` update a single channel each.
 `set_channels(expiry, shutdown)` updates both atomically (both locks held), preventing a
-concurrent `send` from observing one old and one new channel.
+concurrent `send` from observing a mixed channel pair.
 
 ### Configuration
 
@@ -179,6 +230,14 @@ during the snapshot to match the atomicity guarantee of `set_channels`.
   `NoRuntime` when no Tokio runtime is available, SPSC sender drop triggers shutdown,
   MPSC last sender drop triggers shutdown, MPSC clone drop does not trigger shutdown,
   `set_channels` atomically updates both report channels.
+- Per-item expiry coverage includes SPSC and MPSC cases for `send_with_ttl`,
+  `send_with_deadline`, invalid TTL item recovery, MPSC report-channel snapshot preservation,
+  expiry reporting, shutdown reporting, FIFO delivery despite per-item deadline order, and default
+  TTL preservation after per-item sends.
+- Heavy per-item coverage includes multiple cloned MPSC senders using per-item TTL/deadline while
+  preserving clone-local report-channel snapshots, reclaimer wakeup for a later-enqueued earlier
+  deadline, per-item sends interleaved with capacity shrink/growth, and the conservation invariant
+  under mixed default/per-item TTL workloads.
 
 <!--
 This file is part of the caducus crate.

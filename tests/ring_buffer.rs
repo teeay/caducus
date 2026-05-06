@@ -26,12 +26,7 @@ mod concurrency {
         /// can access private fields.
         pub fn validate<T>(ring: &Ring<T>) {
             let cap = ring.capacity();
-            assert!(
-                ring.len <= cap,
-                "len {} exceeds capacity {}",
-                ring.len,
-                cap
-            );
+            assert!(ring.len <= cap, "len {} exceeds capacity {}", ring.len, cap);
             // Verify occupied slots match len.
             let mut occupied = 0;
             for i in 0..ring.len {
@@ -568,6 +563,88 @@ fn shutdown_drain_preserves_slot_metadata() {
     assert!(items[0].expires_at <= after + DEFAULT_TTL);
     assert!(items[0].expiry_channel.is_some());
     assert!(items[0].shutdown_channel.is_some());
+}
+
+#[test]
+fn mpsc_push_with_ttl_uses_item_ttl_without_mutating_default() {
+    let mut ring = new_ring!(4, Duration::from_secs(60));
+    let item_ttl = Duration::from_millis(20);
+    let before = Instant::now();
+    let expires_at = Ring::<i32>::expires_at_from_ttl(item_ttl).unwrap();
+    ring.try_push_mpsc_with_expires_at(1, expires_at, None, None)
+        .expect("per-item TTL push should succeed");
+    let after = Instant::now();
+
+    assert_eq!(ring.ttl(), Duration::from_secs(60));
+    let pop = ring.try_pop().expect("item should be present");
+    assert_eq!(pop.item, 1);
+    assert!(pop.expires_at >= before + item_ttl);
+    assert!(pop.expires_at <= after + item_ttl);
+}
+
+#[test]
+fn per_item_ttl_validation_rejects_out_of_range_duration() {
+    assert!(Ring::<i32>::expires_at_from_ttl(Duration::ZERO).is_err());
+    assert!(Ring::<i32>::expires_at_from_ttl(Duration::from_secs(365 * 24 * 60 * 60 + 1)).is_err());
+}
+
+#[test]
+fn mpsc_push_with_deadline_stores_exact_deadline() {
+    let mut ring = new_ring!(4, DEFAULT_TTL);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    ring.try_push_mpsc_with_expires_at(1, deadline, None, None)
+        .expect("future deadline should be accepted");
+
+    let pop = ring.try_pop().expect("item should be present");
+    assert_eq!(pop.item, 1);
+    assert_eq!(pop.expires_at, deadline);
+}
+
+#[test]
+fn per_item_deadline_validation_rejects_past_deadline() {
+    let deadline = Instant::now() - Duration::from_millis(1);
+    assert!(Ring::<i32>::validate_deadline(deadline).is_err());
+}
+
+#[test]
+fn per_item_deadline_before_previous_tail_sets_full_scan_flag() {
+    let mut ring = new_ring!(4, DEFAULT_TTL);
+    let first_deadline = Instant::now() + Duration::from_secs(60);
+    let second_deadline = Instant::now() + Duration::from_secs(10);
+
+    ring.try_push_mpsc_with_expires_at(1, first_deadline, None, None)
+        .expect("first push should succeed");
+    assert!(!ring.ttl_reduced());
+
+    ring.try_push_mpsc_with_expires_at(2, second_deadline, None, None)
+        .expect("second push should succeed");
+
+    assert!(ring.ttl_reduced());
+    assert_eq!(ring.peek_expires_at(), Some(second_deadline));
+}
+
+#[test]
+fn spsc_per_item_push_variants_use_supplied_expiry() {
+    let mut ring = new_spsc_ring!(4, DEFAULT_TTL, None, None);
+    let ttl = Duration::from_millis(10);
+    let before = Instant::now();
+    let expires_at = Ring::<i32>::expires_at_from_ttl(ttl).unwrap();
+    ring.try_push_spsc_with_expires_at(1, expires_at)
+        .expect("per-item TTL push should succeed");
+    let after = Instant::now();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    ring.try_push_spsc_with_expires_at(2, deadline)
+        .expect("future deadline should be accepted");
+
+    let first = ring.try_pop().expect("first item should be present");
+    assert_eq!(first.item, 1);
+    assert!(first.expires_at >= before + ttl);
+    assert!(first.expires_at <= after + ttl);
+
+    let second = ring.try_pop().expect("second item should be present");
+    assert_eq!(second.item, 2);
+    assert_eq!(second.expires_at, deadline);
 }
 
 #[test]

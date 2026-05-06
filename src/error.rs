@@ -9,9 +9,12 @@
 /// `Full` and `Shutdown` carry the rejected item back to the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaducusErrorKind<T = ()> {
-    /// A configuration value was outside the supported range (for example a TTL
-    /// of zero or capacity of zero).
+    /// A configuration value was outside the supported range, such as a TTL of
+    /// zero.
     InvalidArgument,
+    /// A per-send TTL or deadline was invalid. Carries the rejected item.
+    #[allow(clippy::upper_case_acronyms)]
+    InvalidTTL(T),
     /// The wrong send variant was used for the configured channel mode. Carries
     /// the rejected item.
     InvalidPattern(T),
@@ -37,6 +40,7 @@ impl<T> std::fmt::Display for CaducusError<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
             CaducusErrorKind::InvalidArgument => write!(f, "invalid argument"),
+            CaducusErrorKind::InvalidTTL(_) => write!(f, "invalid TTL"),
             CaducusErrorKind::InvalidPattern(_) => write!(f, "invalid pattern"),
             CaducusErrorKind::NoRuntime => write!(f, "no tokio runtime available"),
             CaducusErrorKind::Timeout => write!(f, "timeout"),
@@ -67,6 +71,7 @@ impl<T> CaducusError<T> {
         match self.kind {
             CaducusErrorKind::Full(item)
             | CaducusErrorKind::Shutdown(item)
+            | CaducusErrorKind::InvalidTTL(item)
             | CaducusErrorKind::InvalidPattern(item) => Some(item),
             _ => None,
         }

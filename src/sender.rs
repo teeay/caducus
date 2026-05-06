@@ -4,13 +4,20 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Handle;
 
-use crate::concurrency::{ChannelMode, ConcurrentRing, ReportChannel};
+use crate::concurrency::{
+    expires_at_from_ttl, validate_deadline, ChannelMode, ConcurrentRing, ReportChannel,
+};
 use crate::error::{CaducusError, CaducusErrorKind};
 use crate::reclaimer;
+
+type ReportChannels<T> = (
+    Option<Arc<dyn ReportChannel<T>>>,
+    Option<Arc<dyn ReportChannel<T>>>,
+);
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -93,7 +100,7 @@ impl<T: Send + 'static> SpscBuilder<T> {
 /// Builder for an MPSC (multi-producer, single-consumer) channel.
 ///
 /// Report channels are optional and set the initial sender-local defaults.
-/// Each item can carry separate reporting channels for each of the producers.
+/// Each sender has its own report-channel configuration.
 pub struct MpscBuilder<T: Send + 'static> {
     capacity: usize,
     ttl: Duration,
@@ -177,10 +184,10 @@ fn resolve_runtime(provided: Option<Handle>) -> Result<Handle, CaducusError> {
 
 /// Single-producer sender. Not cloneable.
 ///
-/// Report channels are fixed at construction inside the ring buffer. Dropping
-/// the sender triggers a hard shutdown of the channel: remaining items are
-/// drained and reported through the shutdown channel (if configured) and the
-/// receiver observes a [`CaducusErrorKind::Shutdown`] on its next call.
+/// Report channels are fixed at construction. Dropping the sender triggers a
+/// hard shutdown of the channel: remaining items are drained and reported
+/// through the shutdown channel (if configured) and the receiver observes a
+/// [`CaducusErrorKind::Shutdown`] on its next call.
 pub struct SpscSender<T: Send + 'static> {
     ring: Arc<ConcurrentRing<T>>,
 }
@@ -214,8 +221,49 @@ impl<T: Send + 'static> SpscSender<T> {
         self.ring.send_spsc(item)
     }
 
-    /// Updates the buffer capacity. Shrinks may evict head items through the
-    /// expiry channel; growth allocates lazily.
+    /// Sends an item with a per-item TTL. Fails with
+    /// [`CaducusErrorKind::InvalidTTL`] if `ttl` is outside the supported
+    /// range. On failure, the rejected item is recoverable via
+    /// [`CaducusError::into_inner`].
+    ///
+    /// Note: using per-item TTLs that make queued expiry deadlines
+    /// non-monotonic causes a slight performance penalty while the buffer uses
+    /// full-scan expiry checks.
+    pub fn send_with_ttl(&self, item: T, ttl: Duration) -> Result<(), CaducusError<T>> {
+        let expires_at = match expires_at_from_ttl(ttl) {
+            Ok(expires_at) => expires_at,
+            Err(()) => {
+                return Err(CaducusError {
+                    kind: CaducusErrorKind::InvalidTTL(item),
+                });
+            }
+        };
+        self.ring.send_spsc_with_expires_at(item, expires_at)
+    }
+
+    /// Sends an item with an absolute expiry deadline. Fails with
+    /// [`CaducusErrorKind::InvalidTTL`] if `deadline` is not in the future.
+    /// Future deadlines are otherwise accepted as caller policy. On failure,
+    /// the rejected item is recoverable via [`CaducusError::into_inner`].
+    ///
+    /// Note: using deadlines that make queued expiry deadlines non-monotonic
+    /// causes a slight performance penalty while the buffer uses full-scan
+    /// expiry checks.
+    pub fn send_with_deadline(&self, item: T, deadline: Instant) -> Result<(), CaducusError<T>> {
+        let expires_at = match validate_deadline(deadline) {
+            Ok(expires_at) => expires_at,
+            Err(()) => {
+                return Err(CaducusError {
+                    kind: CaducusErrorKind::InvalidTTL(item),
+                });
+            }
+        };
+        self.ring.send_spsc_with_expires_at(item, expires_at)
+    }
+
+    /// Updates the buffer capacity. Growth reallocates immediately; shrink
+    /// lowers the effective capacity immediately and compacts after occupancy
+    /// drops to the requested capacity.
     pub fn update_capacity(&self, new: usize) {
         self.ring.update_capacity(new);
     }
@@ -292,6 +340,56 @@ impl<T: Send + 'static> MpscSender<T> {
     /// # }
     /// ```
     pub fn send(&self, item: T) -> Result<(), CaducusError<T>> {
+        let (expiry, shutdown) = self.snapshot_channels();
+        self.ring.send_mpsc(item, expiry, shutdown)
+    }
+
+    /// Sends an item with a per-item TTL. Fails with
+    /// [`CaducusErrorKind::InvalidTTL`] if `ttl` is outside the supported
+    /// range. The item is enqueued with this sender's current report channels
+    /// at the moment of the call.
+    ///
+    /// Note: using per-item TTLs that make queued expiry deadlines
+    /// non-monotonic causes a slight performance penalty while the buffer uses
+    /// full-scan expiry checks.
+    pub fn send_with_ttl(&self, item: T, ttl: Duration) -> Result<(), CaducusError<T>> {
+        let expires_at = match expires_at_from_ttl(ttl) {
+            Ok(expires_at) => expires_at,
+            Err(()) => {
+                return Err(CaducusError {
+                    kind: CaducusErrorKind::InvalidTTL(item),
+                });
+            }
+        };
+        let (expiry, shutdown) = self.snapshot_channels();
+        self.ring
+            .send_mpsc_with_expires_at(item, expires_at, expiry, shutdown)
+    }
+
+    /// Sends an item with an absolute expiry deadline. Fails with
+    /// [`CaducusErrorKind::InvalidTTL`] if `deadline` is not in the future.
+    /// Future deadlines are otherwise accepted as caller policy. The item is
+    /// enqueued with this sender's current report channels at the moment of
+    /// the call.
+    ///
+    /// Note: using deadlines that make queued expiry deadlines non-monotonic
+    /// causes a slight performance penalty while the buffer uses full-scan
+    /// expiry checks.
+    pub fn send_with_deadline(&self, item: T, deadline: Instant) -> Result<(), CaducusError<T>> {
+        let expires_at = match validate_deadline(deadline) {
+            Ok(expires_at) => expires_at,
+            Err(()) => {
+                return Err(CaducusError {
+                    kind: CaducusErrorKind::InvalidTTL(item),
+                });
+            }
+        };
+        let (expiry, shutdown) = self.snapshot_channels();
+        self.ring
+            .send_mpsc_with_expires_at(item, expires_at, expiry, shutdown)
+    }
+
+    fn snapshot_channels(&self) -> ReportChannels<T> {
         let exp = self
             .expiry_channel
             .lock()
@@ -304,7 +402,7 @@ impl<T: Send + 'static> MpscSender<T> {
         let shutdown = shut.clone();
         drop(shut);
         drop(exp);
-        self.ring.send_mpsc(item, expiry, shutdown)
+        (expiry, shutdown)
     }
 
     /// Replaces this sender's expiry channel. Affects only items sent after
@@ -327,8 +425,7 @@ impl<T: Send + 'static> MpscSender<T> {
     }
 
     /// Atomically sets both report channels. Prevents a concurrent `send`
-    /// from observing one old and one new channel when both need to change
-    /// together.
+    /// from observing a mixed channel pair.
     ///
     /// # Examples
     ///
@@ -366,8 +463,9 @@ impl<T: Send + 'static> MpscSender<T> {
         *shut = shutdown;
     }
 
-    /// Updates the buffer capacity. Shrinks may evict head items through their
-    /// expiry channels; growth allocates lazily.
+    /// Updates the buffer capacity. Growth reallocates immediately; shrink
+    /// lowers the effective capacity immediately and compacts after occupancy
+    /// drops to the requested capacity.
     pub fn update_capacity(&self, new: usize) {
         self.ring.update_capacity(new);
     }

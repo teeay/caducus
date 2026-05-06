@@ -16,12 +16,7 @@ use crate::error::{CaducusError, CaducusErrorKind};
 // Reporting
 // ---------------------------------------------------------------------------
 
-/// Reports expired items through their expiry channels.
-///
-/// Single-attempt delivery. On failure or panic, logs a warning and drops the
-/// item. User `ReportChannel` implementations are called inside
-/// `catch_unwind` so a panicking channel cannot kill the reclaimer task or
-/// unwind through a destructor.
+// Reports expired items through their expiry channels.
 pub(crate) fn report_expired<T: 'static>(items: Vec<PopResult<T>>) {
     for pop in items {
         if let Some(ch) = pop.expiry_channel {
@@ -30,11 +25,7 @@ pub(crate) fn report_expired<T: 'static>(items: Vec<PopResult<T>>) {
     }
 }
 
-/// Reports shutdown-drained items through their shutdown channels.
-///
-/// Single-attempt delivery. On failure or panic, logs a warning and drops the
-/// item. User `ReportChannel` implementations are called inside
-/// `catch_unwind` so a panicking channel cannot unwind through a destructor.
+// Reports shutdown-drained items through their shutdown channels.
 pub(crate) fn report_shutdown<T: 'static>(items: Vec<PopResult<T>>) {
     for pop in items {
         if let Some(ch) = pop.shutdown_channel {
@@ -43,19 +34,14 @@ pub(crate) fn report_shutdown<T: 'static>(items: Vec<PopResult<T>>) {
     }
 }
 
-/// Convenience: shut the ring down and report all drained items.
-///
-/// Used by sender and receiver `Drop`, and by explicit `shutdown()` calls on
-/// senders. The concurrency layer releases the ring mutex inside `shutdown()`
-/// before returning the drained items, so reporting always happens outside the
-/// lock.
+// Shuts the ring down and reports all drained items.
 pub(crate) fn shutdown_and_report<T: Send + 'static>(ring: &ConcurrentRing<T>) {
     let items = ring.shutdown();
     drop(ring.reclaimer_reporting_lock());
     report_shutdown(items);
 }
 
-/// Delivers a single item to a report channel with unwind isolation.
+// Delivers a single item to a report channel with unwind isolation.
 fn report_one<T: 'static>(ch: Arc<dyn crate::concurrency::ReportChannel<T>>, item: T, label: &str) {
     match catch_unwind(AssertUnwindSafe(|| ch.send(item))) {
         Ok(Ok(())) => {}
@@ -72,12 +58,8 @@ fn report_one<T: 'static>(ch: Arc<dyn crate::concurrency::ReportChannel<T>>, ite
 // Receiver support
 // ---------------------------------------------------------------------------
 
-/// Drains expired items, reports them, and optionally returns the next live
-/// item. Called by `Receiver::next` on each iteration of its wait loop.
-///
-/// Returns `Ok(Some(item))` if a live item was claimed, `Ok(None)` if the
-/// buffer is empty (caller should wait), or `Err(Shutdown)` if the buffer is
-/// shut down and empty.
+// Drains expired items, reports them, and optionally returns the next live
+// item.
 pub(crate) fn try_receive<T: Send + 'static>(
     ring: &ConcurrentRing<T>,
 ) -> Result<Option<T>, CaducusError> {
@@ -96,10 +78,7 @@ pub(crate) fn try_receive<T: Send + 'static>(
 // Reclaimer task
 // ---------------------------------------------------------------------------
 
-/// Spawns the reclaimer task on the provided runtime.
-///
-/// The task holds a `Weak` reference to the ring and exits when the weak
-/// upgrade fails or the buffer is shut down.
+// Spawns the reclaimer task on the provided runtime.
 pub(crate) fn spawn_reclaimer<T: Send + 'static>(
     ring: Weak<ConcurrentRing<T>>,
     notify_reclaimer: Arc<Notify>,
@@ -129,7 +108,6 @@ async fn reclaimer_loop<T: 'static>(
 
         // Step 3: drain all expired items under one lock.
         let result = strong.drain(Instant::now(), DrainMode::DrainOnly);
-
 
         // Step 4: report drained items (outside the ring lock, holding
         // reclaimer_reporting so shutdown_and_report sees the report flushed).

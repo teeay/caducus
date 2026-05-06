@@ -9,6 +9,8 @@ Status: Developed
 - Serve the receiver through `try_receive`, which drains expired items and claims the next live
   item in a single call.
 - Keep reporting outside the mutex, single-attempt, no backpressure.
+- Continue to reclaim correctly when per-item TTL/deadline sends make queued expiry deadlines
+  non-monotonic.
 
 ## Technical Details
 
@@ -54,8 +56,7 @@ Convenience wrapper that calls `ring.shutdown()` to drain the buffer and then `r
 on the returned items. The concurrency layer releases the ring mutex inside `shutdown()` before
 returning the items, so reporting always happens outside the lock. Used by `SpscSender::shutdown`,
 `SpscSender::drop`, `MpscSender::shutdown`, the last-sender branch of `MpscSender::drop`, and
-`Receiver::drop`. `report_shutdown` remains available for call sites that already hold drained
-items (e.g. the reclaimer task on shutdown exit).
+`Receiver::drop`.
 
 #### Drop-Path Reporting
 
@@ -79,7 +80,7 @@ sender and receiver sides of this contract.
 **`try_receive(ring: &ConcurrentRing<T>) -> Result<Option<T>, CaducusError>`**
 
 Called by `Receiver::next` on each iteration of its wait loop. Bridges the receiver to the
-concurrency layer without exposing internal types.
+concurrency layer.
 
 1. Calls `ring.drain(Instant::now(), DrainMode::DrainAndClaim)`.
 2. Reports any expired items through `report_expired`.
@@ -110,24 +111,26 @@ Arc<tokio::sync::Notify>       // receiver wakeup handle (to signal exposed live
 1. Attempt `Weak::upgrade()`. If it fails, all strong references dropped -- exit.
 2. Create `Notify` waiter via `notify_reclaimer.notified()`. The waiter captures the Notify's
    current version counter.
-3. Call `ConcurrentRing::drain(Instant::now(), DrainMode::DrainOnly)`:
+3. Acquire the reporting barrier, then call
+   `ConcurrentRing::drain(Instant::now(), DrainMode::DrainOnly)`:
    - Returns `DrainResult` with `expired`, `live` (always `None`), `next_deadline`, `is_shutdown`.
-   - Under TTL-shrink transients the underlying drain scans all occupied slots and the
-     `next_deadline` reflects the minimum remaining deadline; otherwise the drain pops the
-     contiguous expired head prefix and `next_deadline` is the head's deadline. Wakeup
-     correctness is preserved because `next_deadline` always points at the soonest remaining
-     deadline.
-4. Drop the strong reference before reporting.
-5. If `is_shutdown` is `true`: call `report_expired(expired)`, then exit.
-6. Call `report_expired(expired)`.
-7. If expired items were drained and a live head is now exposed (`next_deadline.is_some()`):
+   - When deadlines may be non-monotonic because of TTL-shrink transients or per-item
+     TTL/deadline sends, the underlying drain scans all occupied slots and `next_deadline`
+     reflects the minimum remaining deadline; otherwise the drain pops the contiguous expired head
+     prefix and `next_deadline` is the head's deadline. Wakeup correctness is preserved because
+     `next_deadline` always points at the soonest remaining deadline.
+4. Call `report_expired(expired)` outside the ring mutex while holding the reporting barrier.
+5. Release the reporting barrier.
+6. If `is_shutdown` is `true`, exit.
+7. Drop the strong reference.
+8. If expired items were drained and a live head is exposed (`next_deadline.is_some()`):
    call `notify_receiver.notify_waiters()` to wake a blocked receiver.
-8. Check the returned deadline:
+9. Check the returned deadline:
    - Deadline already reached: loop immediately to step 1.
    - Deadline in the future: `tokio::select!` between the waiter and
      `tokio::time::sleep_until(deadline)`.
    - No deadline (buffer empty): `waiter.await`.
-9. On wake: go to step 1.
+10. On wake: go to step 1.
 
 **Wakeup correctness:** The waiter is created at step 2, before `drain` at step 3. This matters
 only when the buffer is empty after drain (no deadline). If a sender pushes an item while the
@@ -147,6 +150,8 @@ was created, so the waiter wakes.
   sender-initiated and receiver-initiated shutdown, `try_receive` used by receiver's `next` loop,
   panicking expiry channel does not kill the reclaimer task, panicking shutdown channel in sender
   drop does not abort, panicking shutdown channel in receiver drop does not abort.
+- Per-item expiry coverage proves that a later-enqueued item with an earlier per-item deadline is
+  reclaimed and reported on time while an older live head remains buffered.
 
 <!--
 This file is part of the caducus crate.

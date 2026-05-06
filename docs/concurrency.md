@@ -6,10 +6,12 @@ Status: Developed
 
 - Serialise access to the ring buffer through one mutex.
 - Coordinate wakeups between sender, receiver, and reclaimer via two `Notify` handles.
-- Expose two send methods (SPSC and MPSC) that pass through to the corresponding ring buffer push
-  variant. Mode enforcement is the ring buffer's responsibility.
+- Expose mode-specific send methods that pass through to the corresponding ring buffer push
+  variants. Mode enforcement is the ring buffer's responsibility.
 - Provide a single unified `drain` method controlled by `DrainMode` for both the reclaimer task
   and the receiver path.
+- Expose additional SPSC and MPSC send delegations for caller-validated absolute per-item expiry
+  deadlines.
 
 ## Technical Details
 
@@ -38,8 +40,9 @@ uses these types on all public-facing methods.
 
 ### Send Path
 
-Two send methods pass through to the corresponding ring buffer push variant. The concurrency layer
-does not check the mode. Both methods fire both Notify handles after a successful push.
+Send methods pass through to the corresponding ring buffer push variant. The concurrency layer
+does not check the mode. All successful send variants fire both Notify handles after a successful
+push.
 
 **`send_spsc(item: T) -> Result<(), CaducusError<T>>`**
 
@@ -52,6 +55,24 @@ does not check the mode. Both methods fire both Notify handles after a successfu
 1. Lock, call `ring.try_push_mpsc(item, expiry_channel, shutdown_channel)`.
 2. On error, return (carries the item).
 3. Unlock, notify reclaimer and receiver.
+
+**`send_spsc_with_expires_at(item: T, expires_at: Instant) -> Result<(), CaducusError<T>>`**
+
+1. Lock, call `ring.try_push_spsc_with_expires_at(item, expires_at)`.
+2. On error, return the rejected item.
+3. Unlock, notify reclaimer and receiver.
+
+**`send_mpsc_with_expires_at(item: T, expires_at: Instant, expiry_channel, shutdown_channel) -> Result<(), CaducusError<T>>`**
+
+1. Lock, call `ring.try_push_mpsc_with_expires_at(item, expires_at, expiry_channel,
+   shutdown_channel)`.
+2. On error, return the rejected item.
+3. Unlock, notify reclaimer and receiver.
+
+The sender layer validates per-item TTLs and deadlines before calling these methods. Invalid
+per-item values therefore return `InvalidTTL(item)` before taking the ring mutex. The concurrency
+layer receives only caller-validated absolute expiry deadlines and keeps the critical section to
+mode-specific ring mutation and notification setup.
 
 ### Drain Path
 
@@ -86,6 +107,7 @@ No side effects (no notify, no reporting) -- callers decide what to do with the 
 
 **`update_ttl(duration) -> Result<(), CaducusError>`** -- delegates to `ring.set_ttl(duration)`.
 Future sends use the updated TTL. Already-enqueued items keep their original `expires_at`.
+Per-item TTL/deadline sends do not mutate the configured default TTL.
 
 **`update_capacity(new: usize)`** -- delegates to `ring.request_capacity(new)`, then notifies
 both handles.
@@ -124,6 +146,8 @@ exits.
 - TTL validation: construction and `update_ttl` reject values outside `1ms..=1 year`.
 - SPSC send: `send_spsc` delegates to `ring.try_push_spsc`, returns `InvalidPattern` in MPSC mode.
 - MPSC send: `send_mpsc` delegates to `ring.try_push_mpsc`, returns `InvalidPattern` in SPSC mode.
+- Per-item expiry delegations accept caller-validated absolute deadlines, preserve item recovery on
+  ring errors, and notify both handles only after successful insertion.
 - Capacity update: `update_capacity` changes ring capacity under the lock.
 - Notify handles: reclaimer and receiver handles are distinct `Arc<Notify>` instances.
 - Poisoned mutex: recovered with `into_inner()`, operations proceed normally.

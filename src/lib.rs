@@ -5,7 +5,7 @@
 //! Bounded async MPSC/SPSC channel with item expiry.
 //!
 //! Caducus (latin) = perishable
-//! 
+//!
 //! Caducus is a bounded asynchronous channel with two operating modes:
 //! single-producer single-consumer ([`SpscBuilder`] / [`SpscSender`]) and
 //! multi-producer single-consumer ([`MpscBuilder`] / [`MpscSender`]). Items
